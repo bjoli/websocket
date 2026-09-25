@@ -1,6 +1,6 @@
 (package
   (name (net websocket))
-  (version "0.1.0")
+  (version "0.1.1")
   (description "Websockets for Bjolang: RFC 6455 over byte ports, and a ws:// client.")
   (license "MPL-2.0")
 

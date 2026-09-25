@@ -476,12 +476,8 @@
                   (stop (Requested "the websocket has closed"))
                   status))
     #:finally (let ()
-                ;; `shutdown!` flushes asynchronously, so that closing the port
-                ;; has nothing left to flush: a stream that refuses synchronous
-                ;; I/O, as Kestrel's does, would otherwise raise from the close.
                 ;; Every step is guarded, because `finished` must close whatever
                 ;; state the connection was left in.
-                (ignore (try (shutdown! out) #:catch (System.Exception)))
                 (ignore (try (close-byte-output-port! out) #:catch (System.Exception)))
                 (ignore (try (close-byte-input-port! in) #:catch (System.Exception)))
                 (inbox-close! (record-ref ws finished)))))
