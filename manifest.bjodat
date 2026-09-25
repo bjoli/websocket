@@ -1,0 +1,9 @@
+(package
+  (name (net websocket))
+  (version "0.1.0")
+  (description "Websockets for Bjolang: RFC 6455 over byte ports, and a ws:// client.")
+  (license "MPL-2.0")
+
+  ;; A library: there is no src/main.bjo, so `bjo build` builds every module
+  ;; under src/ rather than a program.
+  )

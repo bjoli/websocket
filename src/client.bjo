@@ -1,0 +1,205 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+;;
+;; As a special exception to the Mozilla Public License, version 2.0, if you
+;; compile your application source code and portions of this software are
+;; embedded into the generated object code or executable form as a normal
+;; consequence of the compilation process (such as inline functions,
+;; templates, generics, or macros), you may redistribute such embedded portions
+;; in such object code or executable form without complying with the source code
+;; availability requirements or notice obligations of Section 3 of the MPL 2.0.
+
+;; websocket/src/client.bjo — the module (net websocket client).
+;;
+;; The opening handshake from the client's side, over `tcp-connect`, and then
+;; `(net websocket protocol)` on the connection.
+;;
+;;     (with-scope
+;;       (match (websocket-connect "ws://127.0.0.1:8080/echo")
+;;         ((Ok ws)
+;;          (ignore (websocket-send! ws (TextMessage "hello")))
+;;          (def answer (websocket-next ws))
+;;          (websocket-close! ws))
+;;         ((Err e) ...)))
+;;
+;; Not supported: `wss://`, which needs TLS under the connection.
+
+(export websocket-connect)
+
+(import (std prelude))
+(import (std ports))
+(import (std net))
+(import (net websocket protocol))
+
+;; ===========================================================================
+;; Interop
+;; ===========================================================================
+
+(import/class
+  (WsError (: System.Net.WebSockets.WebSocketException (-> string WsError)))
+  (Chunks  (: System.IO.MemoryStream (-> Chunks)))
+  (Url     (: System.Uri (-> string Url) #:exceptions (System.UriFormatException))))
+
+(import/extern
+  (byte->int     (: System.Convert.ToInt32 (-> byte int)))
+  (base64        (: System.Convert.ToBase64String (-> (Array byte) string)))
+  (random-bytes  (: System.Security.Cryptography.RandomNumberGenerator.GetBytes (-> int (Array byte))))
+  (encode        (: System.Text.Encoding.GetBytes (-> Encoding string (Array byte))))
+  (decode        (: System.Text.Encoding.GetString (-> Encoding (Array byte) int int string)
+                    #:exceptions (System.Text.DecoderFallbackException)))
+  (chunk-write!  (: System.IO.MemoryStream.Write (-> Chunks (Array byte) int int void)))
+  (chunk-bytes   (: System.IO.MemoryStream.ToArray (-> Chunks (Array byte))))
+
+  (url-scheme    (: System.Uri.Scheme       (-> Url string) #:get))
+  (url-host      (: System.Uri.DnsSafeHost  (-> Url string) #:get))
+  (url-port      (: System.Uri.Port         (-> Url int) #:get))
+  (url-authority (: System.Uri.Authority    (-> Url string) #:get))
+  (url-path      (: System.Uri.PathAndQuery (-> Url string) #:get)))
+
+(: ws-error (-> string Exception))
+(defun (ws-error message) (cast Exception (WsError. message)))
+
+;; ===========================================================================
+;; The handshake
+;; ===========================================================================
+
+(type (: Target (Record (: host string) (: port int) (: authority string) (: path string))))
+
+(: parse-target (-> string (Result Exception Target)))
+(defun (parse-target text)
+  (match (Url. text)
+    ((Err e) (Err e))
+    ((Ok u)
+     (if (= (url-scheme u) "ws")
+         (Ok (Target (host (url-host u)) (port (url-port u))
+                     (authority (url-authority u)) (path (url-path u))))
+         (Err (ws-error (str "only ws:// is supported, not " (url-scheme u) "://")))))))
+
+(: request-head (-> Target string (Vec string) (Vec (Tuple string string)) string))
+(defun (request-head target key protocols headers)
+  (str "GET " (record-ref target path) " HTTP/1.1\r\n"
+       "Host: " (record-ref target authority) "\r\n"
+       "Upgrade: websocket\r\n"
+       "Connection: Upgrade\r\n"
+       "Sec-WebSocket-Key: " key "\r\n"
+       "Sec-WebSocket-Version: 13\r\n"
+       (if (vec-empty? protocols)
+           ""
+           (str "Sec-WebSocket-Protocol: " (string-join protocols ", ") "\r\n"))
+       (string-join (loop (:for h headers)
+                          (:acc out (vecing (match h ((Tuple name value) (str name ": " value "\r\n"))))))
+                    "")
+       "\r\n"))
+
+;; One byte, or why not.
+(: take-byte (-bjo-> ByteInputPort (Result string (Array byte))))
+(defbjo (take-byte in)
+  (match (sync (read-bytes-evt in 1))
+    ((Ok (Some b)) (Ok b))
+    ((Ok None) (Err "the connection ended during the handshake"))
+    ((Err e) (Err (.-Message e)))))
+
+;; The response head, up to and including the blank line, and not a byte more:
+;; a frame the server sends straight after it has to stay in the port.
+(: read-head (-bjo-> ByteInputPort int (Result string string)))
+(defbjo (read-head in limit)
+  (def acc (Chunks.))
+  (let go ((n 0) (window 0))
+    (cond
+      ;; "\r\n\r\n", as the last four bytes read.
+      ((= window 218762506)
+       (let ((bytes (chunk-bytes acc)))
+         (Ok (match (decode utf8 bytes 0 (array-length bytes))
+               ((Ok text) text)
+               ((Err e) "")))))
+      ((>= n limit) (Err "the handshake response is too long"))
+      (else
+       (match (take-byte in)
+         ((Err why) (Err why))
+         ((Ok b)
+          (chunk-write! acc b 0 1)
+          (go (+ n 1) (bitwise-ior (shift-left window 8) (byte->int (array-ref b 0))))))))))
+
+(: after-colon (-> (Vec string) string))
+(defun (after-colon parts)
+  (string-trim (string-join (loop (:for i (range 1 (vec-length parts)))
+                                  (:acc out (vecing (vec-ref parts i))))
+                            ":")))
+
+;; Header names lower-cased; the first of a repeated header wins.
+(: head-fields (-> (Vec string) (Map string string)))
+(defun (head-fields lines)
+  (loop (:for i (range 1 (vec-length lines)))
+        (:acc all (folding (map-empty)
+                           (let ((parts (string-split (vec-ref lines i) ":")))
+                             (if (< (vec-length parts) 2)
+                                 all
+                                 (let ((name (string-downcase (string-trim (vec-ref parts 0)))))
+                                   (if (map-contains? all name)
+                                       all
+                                       (map-set all name (after-colon parts))))))))))
+
+;; The protocol the server chose, or why the response is not a websocket
+;; handshake for `key`.
+(: check-response (-> string string (Vec string) (Result string string)))
+(defun (check-response head key protocols)
+  (def lines (string-split head "\r\n"))
+  (def status-line (vec-ref lines 0))
+  (def fields (head-fields lines))
+  (def status-parts (string-split status-line " "))
+  (def chosen (map-ref-or fields "sec-websocket-protocol" ""))
+  (cond
+    ((or (< (vec-length status-parts) 2) (not (= (vec-ref status-parts 1) "101")))
+     (Err (str "the server answered " status-line)))
+    ((not (= (string-downcase (map-ref-or fields "upgrade" "")) "websocket"))
+     (Err "the response has no Upgrade: websocket"))
+    ((not (string-contains? (string-downcase (map-ref-or fields "connection" "")) "upgrade"))
+     (Err "the response has no Connection: Upgrade"))
+    ((not (= (map-ref-or fields "sec-websocket-accept" "") (websocket-accept-key key)))
+     (Err "the response has the wrong Sec-WebSocket-Accept"))
+    ((and (not (string-empty? chosen))
+          (not (any? (fun (p) (= p chosen)) protocols)))
+     (Err (str "the server chose a protocol that was not offered: " chosen)))
+    (else (Ok chosen))))
+
+(: shut (-> ByteInputPort ByteOutputPort void))
+(defun (shut in out)
+  (close-byte-output-port! out)
+  (close-byte-input-port! in))
+
+;; ===========================================================================
+;; Connecting
+;; ===========================================================================
+
+;; Connects to a `ws://` URL and runs the opening handshake.
+;;
+;; `#:protocols` is offered as `Sec-WebSocket-Protocol`, and `websocket-protocol`
+;; says which one the server chose. `#:headers` are added to the request as they
+;; are. A response other than `101` is an `Err` whose message has the status
+;; line in it. The connection is owned by the ambient scope, as `tcp-connect`'s
+;; is, and so is the fiber that runs it.
+(: websocket-connect (-bjo-> string
+                             (#:protocols (Vec string))
+                             (#:headers (Vec (Tuple string string)))
+                             (#:max-message int) (#:keep-alive int)
+                             (Result Exception WebSocket)))
+(defbjo (websocket-connect url #:protocols (vec-empty) #:headers (vec-empty)
+                           #:max-message 16777216 #:keep-alive 0)
+  (match (parse-target url)
+    ((Err e) (Err e))
+    ((Ok target)
+     (match (tcp-connect (record-ref target host) (record-ref target port))
+       ((Err e) (Err e))
+       ((Ok (Tuple in out))
+        (def key (base64 (random-bytes 16)))
+        (write-bytes! out (encode utf8 (request-head target key protocols headers)))
+        (flush! out)
+        (match (read-head in 16384)
+          ((Err why) (shut in out) (Err (ws-error why)))
+          ((Ok head)
+           (match (check-response head key protocols)
+             ((Err why) (shut in out) (Err (ws-error why)))
+             ((Ok chosen)
+              (Ok (ports->websocket in out #:client #t #:protocol chosen
+                                    #:max-message max-message #:keep-alive keep-alive)))))))))))

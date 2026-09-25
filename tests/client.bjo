@@ -1,0 +1,178 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+;;
+;; As a special exception to the Mozilla Public License, version 2.0, if you
+;; compile your application source code and portions of this software are
+;; embedded into the generated object code or executable form as a normal
+;; consequence of the compilation process (such as inline functions,
+;; templates, generics, or macros), you may redistribute such embedded portions
+;; in such object code or executable form without complying with the source code
+;; availability requirements or notice obligations of Section 3 of the MPL 2.0.
+
+;; websocket/tests/client.bjo — (net websocket client) over TCP.
+;;
+;;     bjo run tests/client.bjo
+;;
+;; The server end is written here by hand: it reads the request head a byte at
+;; a time, answers the handshake, and then runs `ports->websocket` on the
+;; connection. That checks the request `websocket-connect` sends — path, query,
+;; protocols, extra headers — and how it takes a refusal.
+
+(import (std prelude))
+(import (std ports))
+(import (std net))
+(import (net websocket protocol))
+(import (net websocket client))
+(import (std simpletest))
+
+(import/extern
+  (to-bytes (: System.Text.Encoding.GetBytes (-> Encoding string (Array byte))))
+  (to-text  (: System.Text.Encoding.GetString (-> Encoding (Array byte) string))))
+
+;; ---------------------------------------------------------------------------
+;; Helpers
+;; ---------------------------------------------------------------------------
+
+(: bytes->text (-> (Array byte) string))
+(defun (bytes->text bs)
+  (let loop ((i 0) (acc ""))
+    (if (= i (array-length bs))
+        acc
+        (loop (+ i 1) (str acc (byte->string (array-ref bs i)) ".")))))
+
+(: shown (-> (Option Message) string))
+(defun (shown m)
+  (match m
+    ((Some (TextMessage t)) (str "text:" t))
+    ((Some (BinaryMessage b)) (str "binary:" (bytes->text b)))
+    (None "none")))
+
+(: status-text (-> CloseStatus string))
+(defun (status-text s) (str (int->string (close-code s)) ":" (close-reason s)))
+
+(: ran (-> (Promise string) string))
+(defun (ran p)
+  (match (sync/blocking (promise-join p))
+    ((Ok answer) answer)
+    ((Err e) (str "RAISED " (.-Message e)))))
+
+;; Echoes every message, and answers how many there were.
+(: echo (-bjo-> WebSocket int))
+(defbjo (echo ws)
+  (let go ((n 0))
+    (match (websocket-next ws)
+      ((Some m) (ignore (websocket-send! ws m)) (go (+ n 1)))
+      (None n))))
+
+(: text-bytes (-> string (Array byte)))
+(defun (text-bytes s) (to-bytes utf8 s))
+
+(: send-raw (-bjo-> ByteOutputPort (Array byte) void))
+(defbjo (send-raw out bytes)
+  (write-bytes! out bytes)
+  (flush! out))
+
+;; ---------------------------------------------------------------------------
+;; Over TCP, with the handshake
+;; ---------------------------------------------------------------------------
+
+;; The request head, read a byte at a time so nothing after it is taken.
+(: read-request-head (-bjo-> ByteInputPort string))
+(defbjo (read-request-head in)
+  (let go ((acc ""))
+    (if (string-ends-with? acc "\r\n\r\n")
+        acc
+        (match (read-bytes in 1)
+          ((Some b) (go (str acc (to-text utf8 b))))
+          (None acc)))))
+
+(: header-in (-> string string string))
+(defun (header-in head name)
+  (loop (:for line (string-split head "\r\n"))
+        (:acc found (folding ""
+                             (if (string-starts-with? (string-downcase line) (str name ":"))
+                                 (string-trim (vec-ref (string-split line ": ") 1))
+                                 found)))))
+
+;; Accepts one connection and answers its handshake: with `101` and an echo
+;; server, or with `status` and nothing else.
+(: handshake-server (-bjo-> Listener string string))
+(defbjo (handshake-server l status)
+  (match (accept l)
+    ((Tuple in out)
+     (def head (read-request-head in))
+     (def request-line (vec-ref (string-split head "\r\n") 0))
+     (if (= status "101")
+         (let ()
+           (send-raw out (text-bytes
+                          (str "HTTP/1.1 101 Switching Protocols\r\n"
+                               "Upgrade: websocket\r\n"
+                               "Connection: Upgrade\r\n"
+                               "Sec-WebSocket-Accept: "
+                               (websocket-accept-key (header-in head "sec-websocket-key")) "\r\n"
+                               "Sec-WebSocket-Protocol: chat\r\n\r\n")))
+           (def ws (ports->websocket in out #:protocol "chat"))
+           (str request-line " / " (header-in head "x-hello") " / " (int->string (echo ws))))
+         (let ()
+           (send-raw out (text-bytes (str "HTTP/1.1 " status "\r\nContent-Length: 0\r\n\r\n")))
+           (shutdown! out)
+           (close-byte-output-port! out)
+           (close-byte-input-port! in)
+           request-line)))))
+
+(: scenario-connect (-bjo-> string))
+(defbjo (scenario-connect)
+  (match (tcp-listen "127.0.0.1" 0)
+    ((Err e) (str "listen failed: " (.-Message e)))
+    ((Ok l)
+     (with-open ((listening l))
+       (def server (bjo (handshake-server l "101")))
+       (def said
+         (match (websocket-connect (str "ws://127.0.0.1:" (int->string (listener-port l)) "/chat?room=1")
+                                   #:protocols ["chat" "superchat"]
+                                   #:headers [(Tuple "X-Hello" "there")])
+           ((Err e) (str "refused: " (.-Message e)))
+           ((Ok ws)
+            (ignore (websocket-send! ws (TextMessage "over tcp")))
+            (def back (shown (websocket-next ws)))
+            (websocket-close! ws)
+            (str (websocket-protocol ws) "|" back "|" (status-text (sync (websocket-closed ws)))))))
+       (str said "|"
+            (match (sync (promise-join server))
+              ((Ok s) s)
+              ((Err e) (str "server raised " (.-Message e)))))))))
+
+(: scenario-refused (-bjo-> string))
+(defbjo (scenario-refused)
+  (match (tcp-listen "127.0.0.1" 0)
+    ((Err e) (str "listen failed: " (.-Message e)))
+    ((Ok l)
+     (with-open ((listening l))
+       (def server (bjo (handshake-server l "403 Forbidden")))
+       (def said
+         (match (websocket-connect (str "ws://127.0.0.1:" (int->string (listener-port l)) "/"))
+           ((Err e) (if (string-contains? (.-Message e) "403 Forbidden") "refused with 403" (.-Message e)))
+           ((Ok ws) "accepted")))
+       (ignore (sync (promise-join server)))
+       said))))
+
+(: scenario-bad-url (-bjo-> string))
+(defbjo (scenario-bad-url)
+  (match (websocket-connect "wss://example.invalid/")
+    ((Err e) (.-Message e))
+    ((Ok ws) "accepted")))
+
+(defun (main)
+  (expect "websocket-connect over TCP: path, protocol, headers, echo, close"
+          (ran (bjo (scenario-connect)))
+          "chat|text:over tcp|1000:|GET /chat?room=1 HTTP/1.1 / there / 1")
+
+  (expect "a handshake the server refuses is an Err with its status"
+          (ran (bjo (scenario-refused)))
+          "refused with 403")
+
+  (expect "only ws:// is spoken"
+          (ran (bjo (scenario-bad-url)))
+          "only ws:// is supported, not wss://")
+  0)

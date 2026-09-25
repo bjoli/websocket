@@ -1,0 +1,576 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+;;
+;; As a special exception to the Mozilla Public License, version 2.0, if you
+;; compile your application source code and portions of this software are
+;; embedded into the generated object code or executable form as a normal
+;; consequence of the compilation process (such as inline functions,
+;; templates, generics, or macros), you may redistribute such embedded portions
+;; in such object code or executable form without complying with the source code
+;; availability requirements or notice obligations of Section 3 of the MPL 2.0.
+
+;; websocket/src/protocol.bjo — the module (net websocket protocol).
+;;
+;; RFC 6455 over a pair of byte ports whose opening handshake is already done.
+;; The protocol is written against `(std ports)` and nothing else, so the same
+;; code runs over `tcp-connect` (see `(net websocket client)`), over the stream
+;; an HTTP server hands over after `101 Switching Protocols` (see
+;; `stream->ports` in `(std net)`), and over two `byte-pipe`s in a test.
+;;
+;; Each socket is three fibers. A reader turns frames into whole messages and
+;; queues them in an inbox, which is what makes `websocket-recv` a real CML
+;; event: a message is one item, and a `choose` that another branch wins takes
+;; nothing. A writer owns the output port, because a byte output port must not
+;; be written by two fibers; user sends, pongs and close frames all go through
+;; it. A third fiber runs the close handshake and closes the ports.
+;;
+;;     (: echo (-bjo-> WebSocket void))
+;;     (defbjo (echo ws)
+;;       (let go ()
+;;         (match (websocket-next ws)
+;;           ((Some m) (ignore (websocket-send! ws m)) (go))
+;;           (None unit))))
+;;
+;; Not supported: extensions (permessage-deflate), and sending a message in
+;; fragments. Fragmented messages are received.
+
+(export
+  ;; The types.
+  Message CloseStatus WebSocket
+  close-code close-reason
+
+  ;; Opening one.
+  ports->websocket websocket-accept-key
+
+  ;; Using one.
+  websocket-recv websocket-next
+  websocket-send websocket-send!
+  websocket-close! websocket-closed websocket-protocol)
+
+(import (std prelude))
+(import (std ports))
+(import (std inbox))
+
+;; ===========================================================================
+;; Interop
+;; ===========================================================================
+
+(import/class
+  (Utf8Strict (: System.Text.UTF8Encoding (-> bool bool Utf8Strict))))
+
+(import/extern
+  (int->byte    (: System.Convert.ToByte  (-> int byte)))
+  (byte->int    (: System.Convert.ToInt32 (-> byte int)))
+  (base64       (: System.Convert.ToBase64String (-> (Array byte) string)))
+  (sha1         (: System.Security.Cryptography.SHA1.HashData (-> (Array byte) (Array byte))))
+  (random-bytes (: System.Security.Cryptography.RandomNumberGenerator.GetBytes (-> int (Array byte))))
+  (block-copy   (: System.Buffer.BlockCopy (-> System.Array int System.Array int int void)))
+  (encode       (: System.Text.Encoding.GetBytes (-> Encoding string (Array byte))))
+  (decode       (: System.Text.Encoding.GetString (-> Encoding (Array byte) int int string)
+                   #:exceptions (System.Text.DecoderFallbackException))))
+
+;; Invalid UTF-8 in a text message closes the connection with 1007, so decoding
+;; has to fail rather than substitute U+FFFD.
+(def strict-utf8 (cast Encoding (Utf8Strict. #f #t)))
+
+;; ===========================================================================
+;; The types
+;; ===========================================================================
+
+;; A whole message. A fragmented one arrives reassembled.
+(type (: Message (Union (TextMessage string) (BinaryMessage (Array byte)))))
+
+;; How a connection ended: the code and reason from the close frame, or one of
+;; the codes RFC 6455 reserves for an ending that had none — 1005 when the
+;; peer's close frame carried no code, 1006 when there was no close frame.
+(type (: CloseStatus (Record (: code int) (: reason string))))
+
+(: close-code (-> CloseStatus int))
+(defun (close-code s) (record-ref s code))
+
+(: close-reason (-> CloseStatus string))
+(defun (close-reason s) (record-ref s reason))
+
+;; What the writer is asked to put on the wire. A `SendClose` with code 1005
+;; is a close frame with no body, which is how a close that carried no code is
+;; answered.
+(type (: Outgoing (Union (SendData Message)
+                         (SendPong (Array byte))
+                         SendPing
+                         (SendClose int string))))
+
+;; `sending-over` and `finished` are latches: inboxes that are never posted to,
+;; only closed, because `inbox-closed` then fires for every waiter from then on.
+(type
+  (: WebSocket #:opaque
+     (Record (: incoming (Inbox Message))
+             (: outgoing (Chan Outgoing))
+             ;; Closed by the writer when it will write nothing more.
+             (: sending-over (Inbox Unit))
+             ;; Closed by the reader when it will read nothing more.
+             (: reading-over (Inbox Unit))
+             ;; Closed once the ports are closed and `status` is final.
+             (: finished (Inbox Unit))
+             (: status (Box CloseStatus))
+             (: protocol string))))
+
+(: latch (-> (Inbox Unit)))
+(defun (latch) (make-inbox 1 DropNewest))
+
+;; ===========================================================================
+;; Bytes
+;; ===========================================================================
+
+(: new-bytes (-> int (Array byte)))
+(defun (new-bytes n) (make-array n))
+
+(: byte-at (-> (Array byte) int int))
+(defun (byte-at bs i) (byte->int (array-ref bs i)))
+
+;; `count` bytes from `from`, most significant first. At most four, so that the
+;; result fits an `int`.
+(: big-endian (-> (Array byte) int int int))
+(defun (big-endian bs from count)
+  (let go ((i 0) (acc 0))
+    (if (= i count)
+        acc
+        (go (+ i 1) (+ (* acc 256) (byte-at bs (+ from i)))))))
+
+;; Writes the low `count` bytes of `n` at `at`, most significant first. At most
+;; four: a shift of an `int` by 32 or more wraps.
+(: put-big-endian! (-> (Array byte) int int int void))
+(defun (put-big-endian! bs at count n)
+  (loop (:for i (range 0 count))
+        (:do (array-set! bs (+ at i)
+                         (int->byte (bitwise-and (shift-right n (* 8 (- count 1 i))) 255))))))
+
+(: xor-mask! (-> (Array byte) (Array byte) void))
+(defun (xor-mask! payload key)
+  (loop (:for i (range 0 (array-length payload)))
+        (:do (array-set! payload i (bitwise-xor (array-ref payload i) (array-ref key (% i 4)))))))
+
+;; The parts of a fragmented message, newest first, as one array.
+(: concat-parts (-> (List (Array byte)) int (Array byte)))
+(defun (concat-parts parts size)
+  (match parts
+    ((Cons only (Nil)) only)
+    (_ (let ((out (new-bytes size)))
+         (let go ((rest parts) (end size))
+           (match rest
+             ((Nil) out)
+             ((Cons part more)
+              (let ((at (- end (array-length part))))
+                (block-copy (cast System.Array part) 0 (cast System.Array out) at (array-length part))
+                (go more at)))))))))
+
+(: utf8-bytes (-> string (Array byte)))
+(defun (utf8-bytes s) (encode utf8 s))
+
+;; ===========================================================================
+;; Frames
+;; ===========================================================================
+
+(: control? (-> int bool))
+(defun (control? opcode) (>= opcode 8))
+
+(: known-opcode? (-> int bool))
+(defun (known-opcode? opcode)
+  (or (<= opcode 2) (and (>= opcode 8) (<= opcode 10))))
+
+;; A whole frame: FIN set, the payload length in the shortest form, and the
+;; payload masked with `key` when there is one. Clients mask; servers do not.
+(: frame-bytes (-> int (Array byte) (Option (Array byte)) (Array byte)))
+(defun (frame-bytes opcode payload key)
+  (def n (array-length payload))
+  (def length-size (cond ((< n 126) 0) ((< n 65536) 2) (else 8)))
+  (def mask-bit (match key ((Some k) 128) (None 0)))
+  (def head (+ 2 length-size (match key ((Some k) 4) (None 0))))
+  (def out (new-bytes (+ head n)))
+  (array-set! out 0 (int->byte (bitwise-ior 128 opcode)))
+  (cond
+    ((= length-size 0)
+     (array-set! out 1 (int->byte (bitwise-ior mask-bit n))))
+    ((= length-size 2)
+     (array-set! out 1 (int->byte (bitwise-ior mask-bit 126)))
+     (put-big-endian! out 2 2 n))
+    (else
+     ;; Eight bytes, of which an `int` length fills the low four.
+     (array-set! out 1 (int->byte (bitwise-ior mask-bit 127)))
+     (put-big-endian! out 2 4 0)
+     (put-big-endian! out 6 4 n)))
+  (match key
+    ((Some k)
+     (block-copy (cast System.Array k) 0 (cast System.Array out) (- head 4) 4)
+     (loop (:for i (range 0 n))
+           (:do (array-set! out (+ head i)
+                            (bitwise-xor (array-ref payload i) (array-ref k (% i 4))))))
+     out)
+    (None
+     (block-copy (cast System.Array payload) 0 (cast System.Array out) head n)
+     out)))
+
+;; The body of a close frame. The reason is dropped when it does not fit the
+;; 123 bytes a control frame leaves for it.
+(: close-body (-> int string (Array byte)))
+(defun (close-body code reason)
+  (if (= code 1005)
+      (new-bytes 0)
+      (let* ((text (utf8-bytes reason))
+             (kept (if (> (array-length text) 123) (new-bytes 0) text))
+             (out (new-bytes (+ 2 (array-length kept)))))
+        (put-big-endian! out 0 2 code)
+        (block-copy (cast System.Array kept) 0 (cast System.Array out) 2 (array-length kept))
+        out)))
+
+;; What one read of a frame came to.
+(type (: Received (Union (Got bool int (Array byte))   ; FIN, opcode, unmasked payload
+                         (Violation int string)        ; the close code to fail with
+                         (Hangup string))))            ; the transport ended or failed
+
+;; Exactly `n` bytes, or why not. A short read is the connection ending.
+(: take-bytes (-bjo-> ByteInputPort int (Result string (Array byte))))
+(defbjo (take-bytes in n)
+  (if (= n 0)
+      (Ok (new-bytes 0))
+      (match (sync (read-bytes-evt in n))
+        ((Ok (Some bs))
+         (if (= (array-length bs) n) (Ok bs) (Err "the connection ended in the middle of a frame")))
+        ((Ok None) (Err "the connection ended without a close frame"))
+        ((Err e) (Err (.-Message e))))))
+
+;; The extended payload length. The 64-bit form is refused above 2^31 - 1,
+;; which is already past any `#:max-message` an `int` can say.
+(: payload-length (-bjo-> ByteInputPort int (Result Received int)))
+(defbjo (payload-length in len7)
+  (cond
+    ((< len7 126) (Ok len7))
+    ((= len7 126)
+     (match (take-bytes in 2)
+       ((Ok bs) (Ok (big-endian bs 0 2)))
+       ((Err why) (Err (Hangup why)))))
+    (else
+     (match (take-bytes in 8)
+       ((Err why) (Err (Hangup why)))
+       ((Ok bs)
+        (cond
+          ((>= (byte-at bs 0) 128) (Err (Violation 1002 "a frame length with its top bit set")))
+          ((or (> (big-endian bs 0 4) 0) (>= (byte-at bs 4) 128))
+           (Err (Violation 1009 "the message is too big")))
+          (else (Ok (big-endian bs 4 4)))))))))
+
+(: read-payload (-bjo-> ByteInputPort bool int bool int int Received))
+(defbjo (read-payload in fin opcode masked len7 max-message)
+  (match (payload-length in len7)
+    ((Err r) r)
+    ((Ok n)
+     (if (> n max-message)
+         (Violation 1009 "the message is too big")
+         (match (take-bytes in (if masked 4 0))
+           ((Err why) (Hangup why))
+           ((Ok key)
+            (match (take-bytes in n)
+              ((Err why) (Hangup why))
+              ((Ok payload)
+               (when masked (xor-mask! payload key))
+               (Got fin opcode payload)))))))))
+
+;; One frame. A server requires every frame masked and a client requires none
+;; to be, which is RFC 6455 section 5.1.
+(: read-frame (-bjo-> ByteInputPort bool int Received))
+(defbjo (read-frame in client max-message)
+  (match (take-bytes in 2)
+    ((Err why) (Hangup why))
+    ((Ok head)
+     (let* ((b0 (byte-at head 0))
+            (b1 (byte-at head 1))
+            (fin (not (= (bitwise-and b0 128) 0)))
+            (opcode (bitwise-and b0 15))
+            (masked (not (= (bitwise-and b1 128) 0)))
+            (len7 (bitwise-and b1 127)))
+       (cond
+         ((not (= (bitwise-and b0 112) 0)) (Violation 1002 "reserved bits set with no extension"))
+         ((not (known-opcode? opcode)) (Violation 1002 "an unknown opcode"))
+         ((and (control? opcode) (not fin)) (Violation 1002 "a fragmented control frame"))
+         ((and (control? opcode) (> len7 125)) (Violation 1002 "a control frame over 125 bytes"))
+         ((and client masked) (Violation 1002 "a masked frame from the server"))
+         ((and (not client) (not masked)) (Violation 1002 "an unmasked frame from the client"))
+         (else (read-payload in fin opcode masked len7 max-message)))))))
+
+(: valid-close-code? (-> int bool))
+(defun (valid-close-code? c)
+  (or (and (>= c 1000) (<= c 1003))
+      (and (>= c 1007) (<= c 1014))
+      (and (>= c 3000) (<= c 4999))))
+
+;; A received close frame, or the code to fail the connection with.
+(: parse-close (-> (Array byte) (Result (Tuple int string) CloseStatus)))
+(defun (parse-close body)
+  (def n (array-length body))
+  (cond
+    ((= n 0) (Ok (CloseStatus (code 1005) (reason ""))))
+    ((= n 1) (Err (Tuple 1002 "a close frame with a one-byte body")))
+    (:def code (big-endian body 0 2))
+    ((not (valid-close-code? code)) (Err (Tuple 1002 "an invalid close code")))
+    (else
+     (match (decode strict-utf8 body 2 (- n 2))
+       ((Ok text) (Ok (CloseStatus (code code) (reason text))))
+       ((Err e) (Err (Tuple 1007 "a close reason that is not UTF-8")))))))
+
+(: to-message (-> int (Array byte) (Result string Message)))
+(defun (to-message kind payload)
+  (if (= kind 1)
+      (match (decode strict-utf8 payload 0 (array-length payload))
+        ((Ok text) (Ok (TextMessage text)))
+        ((Err e) (Err "a text message that is not UTF-8")))
+      (Ok (BinaryMessage payload))))
+
+;; ===========================================================================
+;; The reader
+;; ===========================================================================
+
+;; Hands `item` to the writer, or answers `#f` when the writer has already
+;; finished — after a close frame there is nothing more to send.
+(: to-writer (-bjo-> WebSocket Outgoing bool))
+(defbjo (to-writer ws item)
+  (sync (choose (wrap (chan-send (record-ref ws outgoing) item) (fun (u) #t))
+                (wrap (inbox-closed (record-ref ws sending-over)) (fun (e) #f)))))
+
+;; Fails the connection (RFC 6455 section 7.1.7): a close frame with `code`,
+;; and nothing read after it.
+(: fail-with (-bjo-> WebSocket int string CloseStatus))
+(defbjo (fail-with ws code why)
+  (ignore (to-writer ws (SendClose code why)))
+  (CloseStatus (code code) (reason why)))
+
+;; Once a close frame has been sent, a message nobody reads must not stop the
+;; reader from reaching the peer's close frame, so it is dropped instead of
+;; waited for.
+(: deliver (-bjo-> WebSocket Message void))
+(defbjo (deliver ws m)
+  (sync (choose (wrap (inbox-send-evt (record-ref ws incoming) m) (fun (u) unit))
+                (wrap (inbox-closed (record-ref ws sending-over)) (fun (e) unit)))))
+
+;; The peer's close frame, answered with the same code.
+(: peer-closed (-bjo-> WebSocket (Array byte) CloseStatus))
+(defbjo (peer-closed ws body)
+  (match (parse-close body)
+    ((Err (Tuple code why)) (fail-with ws code why))
+    ((Ok status)
+     (ignore (to-writer ws (SendClose (close-code status) "")))
+     status)))
+
+;; Frames until a close frame, a violation or the end of the connection. `kind`
+;; is the opcode of the message being reassembled, 0 between messages.
+(: read-loop (-bjo-> WebSocket ByteInputPort bool int CloseStatus))
+(defbjo (read-loop ws in client max-message)
+  (let go ((kind 0) (parts (list)) (size 0))
+    (match (read-frame in client max-message)
+      ((Hangup why) (CloseStatus (code 1006) (reason why)))
+      ((Violation code why) (fail-with ws code why))
+      ((Got fin opcode payload)
+       (cond
+         ((= opcode 9)
+          (ignore (to-writer ws (SendPong payload)))
+          (go kind parts size))
+         ((= opcode 10) (go kind parts size))
+         ((= opcode 8) (peer-closed ws payload))
+         ((and (= opcode 0) (= kind 0))
+          (fail-with ws 1002 "a continuation frame with no message to continue"))
+         ((and (> opcode 0) (> kind 0))
+          (fail-with ws 1002 "a new message inside a fragmented one"))
+         (:def now-kind (if (= opcode 0) kind opcode))
+         (:def now-size (+ size (array-length payload)))
+         ((> now-size max-message) (fail-with ws 1009 "the message is too big"))
+         ((not fin) (go now-kind (cons payload parts) now-size))
+         (else
+          (match (to-message now-kind (concat-parts (cons payload parts) now-size))
+            ((Err why) (fail-with ws 1007 why))
+            ((Ok m)
+             (deliver ws m)
+             (go 0 (list) 0)))))))))
+
+(: reading (-bjo-> WebSocket ByteInputPort bool int CloseStatus))
+(defbjo (reading ws in client max-message)
+  (try (read-loop ws in client max-message)
+    #:finally (let ()
+                (inbox-close! (record-ref ws incoming))
+                (inbox-close! (record-ref ws reading-over)))))
+
+;; ===========================================================================
+;; The writer
+;; ===========================================================================
+
+(: write-item! (-bjo-> ByteOutputPort bool Outgoing void))
+(defbjo (write-item! out client item)
+  (def key (if client (Some (random-bytes 4)) None))
+  (write-bytes! out
+                (match item
+                  ((SendData (TextMessage s)) (frame-bytes 1 (utf8-bytes s) key))
+                  ((SendData (BinaryMessage b)) (frame-bytes 2 b key))
+                  ((SendPong b) (frame-bytes 10 b key))
+                  (SendPing (frame-bytes 9 (new-bytes 0) key))
+                  ((SendClose code reason) (frame-bytes 8 (close-body code reason) key))))
+  (flush! out))
+
+(: idle (-> int (Event Unit)))
+(defun (idle keep-alive)
+  (if (> keep-alive 0) (timeout keep-alive) (never)))
+
+;; Until a close frame is written, or the reader has finished without handing
+;; one over — the connection is gone and there is nobody to write to.
+(: write-loop (-bjo-> WebSocket ByteOutputPort bool int void))
+(defbjo (write-loop ws out client keep-alive)
+  (let go ()
+    (match (sync (choose (wrap (chan-recv (record-ref ws outgoing)) (fun (item) (Some item)))
+                         (wrap (inbox-closed (record-ref ws reading-over)) (fun (e) None))
+                         (wrap (idle keep-alive) (fun (u) (Some SendPing)))))
+      (None unit)
+      ((Some item)
+       (write-item! out client item)
+       (match item
+         ((SendClose c r) unit)
+         (_ (go)))))))
+
+;; A failed write ends the writer. The reader is then left to find out the same
+;; thing, or to be stopped by the close timeout.
+(: writing (-bjo-> WebSocket ByteOutputPort bool int void))
+(defbjo (writing ws out client keep-alive)
+  (try (ignore (try (write-loop ws out client keep-alive) #:catch (System.Exception)))
+    #:finally (inbox-close! (record-ref ws sending-over))))
+
+;; ===========================================================================
+;; The connection
+;; ===========================================================================
+
+(: status-of (-> (Result Exception CloseStatus) CloseStatus))
+(defun (status-of r)
+  (match r
+    ((Ok s) s)
+    ((Err e) (CloseStatus (code 1006) (reason (.-Message e))))))
+
+;; Runs the reader and the writer, and waits for whichever did not finish first
+;; for at most `close-timeout` ms. When the reader finishes first, the peer
+;; closed or the connection broke, and the writer only has the reply to send.
+;; When the writer finishes first, a close frame went out and the reader is
+;; waiting for the peer's.
+(: run-connection (-bjo-> WebSocket ByteInputPort ByteOutputPort bool int int int void))
+(defbjo (run-connection ws in out client max-message keep-alive close-timeout)
+  (try
+      (box-set! (record-ref ws status)
+                (with-cancel (stop)
+                  (def writer (bjo (writing ws out client keep-alive)))
+                  (def reader (bjo (reading ws in client max-message)))
+                  (def status
+                    (match (sync (choose (wrap (promise-join reader) (fun (r) (Some r)))
+                                         (wrap (promise-join writer) (fun (r) None))))
+                      ((Some r)
+                       (ignore (sync (choose (wrap (promise-join writer) (fun (w) unit))
+                                             (wrap (timeout close-timeout) (fun (u) unit)))))
+                       (status-of r))
+                      (None
+                       (match (sync (choose (wrap (promise-join reader) (fun (r) (Some r)))
+                                            (wrap (timeout close-timeout) (fun (u) None))))
+                         ((Some r) (status-of r))
+                         (None (CloseStatus (code 1006) (reason "no close frame came back")))))))
+                  (stop (Requested "the websocket has closed"))
+                  status))
+    #:finally (let ()
+                ;; `shutdown!` flushes asynchronously, so that closing the port
+                ;; has nothing left to flush: a stream that refuses synchronous
+                ;; I/O, as Kestrel's does, would otherwise raise from the close.
+                ;; Every step is guarded, because `finished` must close whatever
+                ;; state the connection was left in.
+                (ignore (try (shutdown! out) #:catch (System.Exception)))
+                (ignore (try (close-byte-output-port! out) #:catch (System.Exception)))
+                (ignore (try (close-byte-input-port! in) #:catch (System.Exception)))
+                (inbox-close! (record-ref ws finished)))))
+
+;; ===========================================================================
+;; Opening one
+;; ===========================================================================
+
+;; A websocket over two ports whose opening handshake is already done.
+;;
+;; The connection runs on a daemon fiber of the ambient scope: it ends on its
+;; own when either side closes, and a scope that returns first cancels it with
+;; no close frame. `websocket-close!` is the orderly way out.
+;;
+;; `#:client` says which side of the protocol this is: a client masks what it
+;; sends and a server refuses anything unmasked. `#:protocol` is what the
+;; handshake agreed on, for `websocket-protocol`. `#:max-message` bounds a
+;; message after reassembly; a bigger one closes the connection with 1009.
+;; `#:keep-alive` sends a ping after that many idle milliseconds, 0 for never.
+;; `#:close-timeout` is how long either side of the close handshake is waited
+;; for before the connection is dropped.
+(: ports->websocket (-> ByteInputPort ByteOutputPort
+                        (#:client bool) (#:protocol string) (#:max-message int)
+                        (#:keep-alive int) (#:close-timeout int)
+                        WebSocket))
+(defun (ports->websocket in out #:client #f #:protocol "" #:max-message 16777216
+                         #:keep-alive 0 #:close-timeout 5000)
+  (def ws (WebSocket (incoming (make-inbox 16 DropNewest))
+                     (outgoing (make-chan))
+                     (sending-over (latch))
+                     (reading-over (latch))
+                     (finished (latch))
+                     (status (make-box (CloseStatus (code 1006) (reason "the connection was dropped"))))
+                     (protocol protocol)))
+  (spawn/daemon (run-connection ws in out client max-message keep-alive close-timeout))
+  ws)
+
+;; `Sec-WebSocket-Accept` for a `Sec-WebSocket-Key`, RFC 6455 section 4.2.2.
+(: websocket-accept-key (-> string string))
+(defun (websocket-accept-key key)
+  (base64 (sha1 (utf8-bytes (str key "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")))))
+
+;; ===========================================================================
+;; Using one
+;; ===========================================================================
+
+;; The next message. A real CML event: in a `choose` that another branch wins,
+;; the message stays for the next receive.
+;;
+;; Once the connection has closed and every message has been taken, this never
+;; fires; `websocket-next` is the form that notices.
+(: websocket-recv (-> WebSocket (Event Message)))
+(defun (websocket-recv ws) (inbox-recv (record-ref ws incoming)))
+
+;; The next message, or `None` once the connection has closed and every message
+;; that arrived before the close has been taken.
+(: websocket-next (-bjo-> WebSocket (Option Message)))
+(defbjo (websocket-next ws)
+  (sync (choose (wrap (websocket-recv ws) (fun (m) (Some m)))
+                (wrap (inbox-closed (record-ref ws incoming)) (fun (e) None)))))
+
+;; Commits when the writer has taken the message, with `#t`, or with `#f` once
+;; a close frame has gone out and nothing more will be sent. In a `choose` that
+;; another branch wins, nothing is sent.
+(: websocket-send (-> WebSocket Message (Event bool)))
+(defun (websocket-send ws m)
+  (choose (wrap (chan-send (record-ref ws outgoing) (SendData m)) (fun (u) #t))
+          (wrap (inbox-closed (record-ref ws sending-over)) (fun (e) #f))))
+
+(: websocket-send! (-bjo-> WebSocket Message bool))
+(defbjo (websocket-send! ws m) (sync (websocket-send ws m)))
+
+;; Sends a close frame and waits until the connection is over: the peer has
+;; answered, or `#:close-timeout` has passed, and the ports are closed. On a
+;; connection that is already closing it only waits.
+;;
+;; `#:reason` is dropped when it is over 123 bytes of UTF-8.
+(: websocket-close! (-bjo-> WebSocket (#:code int) (#:reason string) void))
+(defbjo (websocket-close! ws #:code 1000 #:reason "")
+  (ignore (to-writer ws (SendClose code reason)))
+  (ignore (sync (inbox-closed (record-ref ws finished)))))
+
+;; Fires once the connection is over, with how it ended, and from then on
+;; commits immediately on every `sync`.
+(: websocket-closed (-> WebSocket (Event CloseStatus)))
+(defun (websocket-closed ws)
+  (wrap (inbox-closed (record-ref ws finished))
+        (fun (e) (box-ref (record-ref ws status)))))
+
+;; The subprotocol the handshake agreed on, or `""`.
+(: websocket-protocol (-> WebSocket string))
+(defun (websocket-protocol ws) (record-ref ws protocol))

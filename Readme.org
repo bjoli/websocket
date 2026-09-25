@@ -1,0 +1,139 @@
+* (net websocket) — websockets for Bjolang
+
+RFC 6455 over byte ports, and a ~ws://~ client.
+
+#+BEGIN_SRC scheme
+(import (net websocket protocol))
+(import (net websocket client))
+
+(defbjo (main args)
+  (match (websocket-connect "ws://127.0.0.1:8080/echo")
+    ((Err e) 1)
+    ((Ok ws)
+     (ignore (websocket-send! ws (TextMessage "hello")))
+     (println (match (websocket-next ws)
+                ((Some (TextMessage t)) t)
+                (_ "nothing")))
+     (websocket-close! ws)
+     0)))
+#+END_SRC
+
+The protocol is written against ~(std ports)~ and nothing else. The same code
+runs over ~tcp-connect~, over the stream an HTTP server hands over after ~101
+Switching Protocols~ (see ~stream->ports~ in ~(std net)~, and ~bjoweb~ for a
+server that does), and over two ~byte-pipe~ s in a test, with no socket
+anywhere. There is no C# in this package.
+
+** The modules
+
+| Module                      | What is in it                                            |
+|-----------------------------+----------------------------------------------------------|
+| ~(net websocket protocol)~  | the types, ~ports->websocket~, sending, receiving, closing |
+| ~(net websocket client)~    | ~websocket-connect~: the client handshake over TCP        |
+
+A server imports only the first. The client handshake is the second so that a
+server does not carry it.
+
+** Installing it
+
+#+BEGIN_SRC scheme
+(depends
+  (package (name (net websocket))
+           (version (version-at-least "0.1.0"))
+           (source (git (url "https://github.com/bjoli/websocket")))))
+#+END_SRC
+
+** Types =(net websocket protocol)=
+
+- ~Message~ : ~(TextMessage string)~ or ~(BinaryMessage (Array byte))~. Always a
+  whole message: a fragmented one arrives reassembled.
+- ~CloseStatus~ : ~(Record (: code int) (: reason string))~, read with
+  ~close-code~ and ~close-reason~. Besides the codes a peer sends, 1005 means
+  the peer's close frame had no code and 1006 that there was no close frame at
+  all — the connection broke, or the close handshake timed out.
+- ~WebSocket~ : opaque.
+
+** Opening one
+
+- ~(websocket-connect url #:protocols [] #:headers [] #:max-message 16777216
+  #:keep-alive 0)~ : ~(Result Exception WebSocket)~, in ~(net websocket
+  client)~. Connects to a ~ws://~ URL and runs the opening handshake.
+  ~#:protocols~ is offered as ~Sec-WebSocket-Protocol~; ~#:headers~ are added
+  to the request as they are. A response other than ~101~ is an ~Err~ whose
+  message holds the status line.
+- ~(ports->websocket in out #:client #f #:protocol "" #:max-message 16777216
+  #:keep-alive 0 #:close-timeout 5000)~ : ~WebSocket~. A socket over two ports
+  whose handshake is already done. ~#:client~ says which side of the protocol
+  this is: a client masks what it sends, and a server refuses anything unmasked.
+  ~#:protocol~ is what the handshake agreed on.
+- ~(websocket-accept-key key)~ : the ~Sec-WebSocket-Accept~ for a
+  ~Sec-WebSocket-Key~, for a server doing its own handshake.
+
+~#:max-message~ bounds a message after reassembly; a bigger one closes the
+connection with 1009. ~#:keep-alive~ sends a ping after that many idle
+milliseconds, 0 for never. ~#:close-timeout~ is how long each side of the close
+handshake is waited for before the connection is dropped.
+
+Not supported: ~wss://~, extensions (so no permessage-deflate), and sending a
+message in fragments.
+
+** Using one
+
+- ~(websocket-recv ws)~ : ~(Event Message)~. A real CML event: in a ~choose~
+  another branch wins, the message stays for the next receive. Once the
+  connection has closed and every message is taken it never fires.
+- ~(websocket-next ws)~ : ~(Option Message)~. The next message, or ~None~ once
+  the connection has closed and every message that arrived before the close has
+  been taken. The usual loop.
+- ~(websocket-send ws m)~ : ~(Event bool)~. Commits with ~#t~ when the writer
+  has taken the message, or with ~#f~ once a close frame has gone out and
+  nothing more will be sent. A losing branch sends nothing.
+- ~(websocket-send! ws m)~ : the same, synced.
+- ~(websocket-close! ws #:code 1000 #:reason "")~ : sends a close frame and
+  waits until the connection is over — the peer has answered or
+  ~#:close-timeout~ has passed — and the ports are closed. A reason over 123
+  bytes of UTF-8 is dropped.
+- ~(websocket-closed ws)~ : ~(Event CloseStatus)~. Fires once the connection is
+  over, and from then on on every ~sync~.
+- ~(websocket-protocol ws)~ : the subprotocol the handshake agreed on, or ~""~.
+
+A chat session waits on the client and on the room at once:
+
+#+BEGIN_SRC scheme
+(sync (choose (wrap (websocket-recv ws) (fun (m) (FromClient m)))
+              (wrap (inbox-recv room) (fun (line) (FromRoom line)))
+              (wrap (websocket-closed ws) (fun (s) Gone))))
+#+END_SRC
+
+** How it runs
+
+Three fibers per socket. A reader turns frames into messages and queues them in
+an inbox, which is what makes ~websocket-recv~ an event that loses nothing. A
+writer owns the output port — a byte output port must not be written by two
+fibers — so user sends, pongs and close frames all go through it. A third runs
+the close handshake and closes the ports.
+
+That fiber is a daemon of the ambient scope. A connection ends on its own when
+either side closes, and a scope that returns first cancels it without a close
+frame; ~websocket-close!~ is the orderly way out.
+
+A message nobody receives holds the reader up once the inbox is full, which
+holds the TCP connection up: that is backpressure, and it also means pings go
+unanswered until something reads. After a close frame has been sent, messages
+still arriving are dropped rather than waited for, so the peer's close frame is
+always reached.
+
+The connection is failed — a close frame with the code, then nothing more — for
+an unmasked frame from a client or a masked one from a server (1002), reserved
+bits or an unknown opcode (1002), a fragmented or oversized control frame
+(1002), a continuation with nothing to continue or a new message inside a
+fragmented one (1002), an invalid close code (1002), a text message or close
+reason that is not UTF-8 (1007), and a message over ~#:max-message~ (1009).
+UTF-8 is checked once the message is whole.
+
+** Running the tests
+
+#+BEGIN_SRC sh
+bjo run tests/protocol.bjo   ;; both ends over byte pipes, and hand-written frames
+bjo run tests/client.bjo     ;; websocket-connect over TCP
+#+END_SRC

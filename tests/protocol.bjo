@@ -1,0 +1,335 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+;;
+;; As a special exception to the Mozilla Public License, version 2.0, if you
+;; compile your application source code and portions of this software are
+;; embedded into the generated object code or executable form as a normal
+;; consequence of the compilation process (such as inline functions,
+;; templates, generics, or macros), you may redistribute such embedded portions
+;; in such object code or executable form without complying with the source code
+;; availability requirements or notice obligations of Section 3 of the MPL 2.0.
+
+;; websocket/tests/protocol.bjo — (net websocket protocol) over byte pipes.
+;;
+;;     bjo run tests/protocol.bjo
+;;
+;; All of it runs over two `byte-pipe`s, with no socket anywhere. Where both
+;; ends are `ports->websocket` it checks the two implementations against each
+;; other; where one end is written by hand as raw frames it checks the wire
+;; format and what the protocol requires of a server — masking, fragments with
+;; a control frame between them, the codes a violation closes with.
+
+(import (std prelude))
+(import (std ports))
+(import (net websocket protocol))
+(import (std simpletest))
+
+(import/extern
+  (int->byte (: System.Convert.ToByte  (-> int byte)))
+  (byte->int (: System.Convert.ToInt32 (-> byte int)))
+  (to-bytes  (: System.Text.Encoding.GetBytes (-> Encoding string (Array byte))))
+  (from-hex  (: System.Convert.FromHexString (-> string (Array byte)))))
+
+;; ---------------------------------------------------------------------------
+;; Helpers
+;; ---------------------------------------------------------------------------
+
+(: bytes->text (-> (Array byte) string))
+(defun (bytes->text bs)
+  (let loop ((i 0) (acc ""))
+    (if (= i (array-length bs))
+        acc
+        (loop (+ i 1) (str acc (byte->string (array-ref bs i)) ".")))))
+
+(: shown (-> (Option Message) string))
+(defun (shown m)
+  (match m
+    ((Some (TextMessage t)) (str "text:" t))
+    ((Some (BinaryMessage b)) (str "binary:" (bytes->text b)))
+    (None "none")))
+
+(: status-text (-> CloseStatus string))
+(defun (status-text s) (str (int->string (close-code s)) ":" (close-reason s)))
+
+(: ran (-> (Promise string) string))
+(defun (ran p)
+  (match (sync/blocking (promise-join p))
+    ((Ok answer) answer)
+    ((Err e) (str "RAISED " (.-Message e)))))
+
+;; A server's ports and a client's ports, joined by two pipes.
+(: duplex (-> (Tuple (Tuple ByteInputPort ByteOutputPort) (Tuple ByteInputPort ByteOutputPort))))
+(defun (duplex)
+  (match (byte-pipe)
+    ((Tuple up-in up-out)
+     (match (byte-pipe)
+       ((Tuple down-in down-out)
+        (Tuple (Tuple up-in down-out) (Tuple down-in up-out)))))))
+
+;; Echoes every message, and answers how many there were.
+(: echo (-bjo-> WebSocket int))
+(defbjo (echo ws)
+  (let go ((n 0))
+    (match (websocket-next ws)
+      ((Some m) (ignore (websocket-send! ws m)) (go (+ n 1)))
+      (None n))))
+
+(: joined (-bjo-> (Promise int) string))
+(defbjo (joined p)
+  (match (sync (promise-join p))
+    ((Ok n) (int->string n))
+    ((Err e) (str "raised " (.-Message e)))))
+
+(: pattern-at (-> int int))
+(defun (pattern-at i) (% i 251))
+
+(: patterned (-> int (Array byte)))
+(defun (patterned n)
+  (def out (make-array n))
+  (loop (:for i (range 0 n))
+        (:do (array-set! out i (int->byte (pattern-at i)))))
+  out)
+
+(: intact (-> (Option Message) string))
+(defun (intact m)
+  (match m
+    ((Some (BinaryMessage b))
+     (str (int->string (array-length b)) ":"
+          (if (loop (:for i (range 0 (array-length b)))
+                    (:acc ok (folding #t (and ok (= (byte->int (array-ref b i)) (pattern-at i))))))
+              "intact"
+              "corrupt")))
+    (other (shown other))))
+
+;; ---------------------------------------------------------------------------
+;; Raw frames, for the end that is written by hand
+;; ---------------------------------------------------------------------------
+
+;; A client frame, masked with 1 2 3 4. Payloads under 126 bytes only.
+(: client-frame (-> bool int (Array byte) (Array byte)))
+(defun (client-frame fin opcode payload)
+  (def n (array-length payload))
+  (def key #[1 2 3 4])
+  (def out (make-array (+ 6 n)))
+  (array-set! out 0 (int->byte (+ (if fin 128 0) opcode)))
+  (array-set! out 1 (int->byte (+ 128 n)))
+  (loop (:for i (range 0 4)) (:do (array-set! out (+ 2 i) (array-ref key i))))
+  (loop (:for i (range 0 n))
+        (:do (array-set! out (+ 6 i) (bitwise-xor (array-ref payload i) (array-ref key (% i 4))))))
+  out)
+
+(: text-bytes (-> string (Array byte)))
+(defun (text-bytes s) (to-bytes utf8 s))
+
+(: close-payload (-> int (Array byte)))
+(defun (close-payload code)
+  (def out (make-array 2))
+  (array-set! out 0 (int->byte (bitwise-and (shift-right code 8) 255)))
+  (array-set! out 1 (int->byte (bitwise-and code 255)))
+  out)
+
+(: send-raw (-bjo-> ByteOutputPort (Array byte) void))
+(defbjo (send-raw out bytes)
+  (write-bytes! out bytes)
+  (flush! out))
+
+;; One frame from the server, unmasked and under 126 bytes, as "opcode:body".
+;; A close frame's body is its code; anything else is its bytes.
+(: raw-frame (-bjo-> ByteInputPort string))
+(defbjo (raw-frame in)
+  (match (read-bytes in 2)
+    (None "eof")
+    ((Some head)
+     (let* ((opcode (bitwise-and (byte->int (array-ref head 0)) 15))
+            (n (bitwise-and (byte->int (array-ref head 1)) 127))
+            (body (if (= n 0)
+                      (make-array 0)
+                      (match (read-bytes in n) ((Some b) b) (None (make-array 0))))))
+       (str (int->string opcode) ":"
+            (if (and (= opcode 8) (>= (array-length body) 2))
+                (int->string (+ (* 256 (byte->int (array-ref body 0))) (byte->int (array-ref body 1))))
+                (bytes->text body)))))))
+
+;; The first frame that is not a ping.
+(: past-pings (-bjo-> ByteInputPort string))
+(defbjo (past-pings in)
+  (let ((f (raw-frame in)))
+    (if (= f "9:") (past-pings in) f)))
+
+;; ---------------------------------------------------------------------------
+;; Two implementations talking to each other
+;; ---------------------------------------------------------------------------
+
+(: scenario-echo (-bjo-> string))
+(defbjo (scenario-echo)
+  (with-scope
+    (match (duplex)
+      ((Tuple (Tuple sin sout) (Tuple cin cout))
+       (def server (ports->websocket sin sout))
+       (def client (ports->websocket cin cout #:client #t))
+       (def echoed (bjo (echo server)))
+       (ignore (websocket-send! client (TextMessage "hello")))
+       (ignore (websocket-send! client (BinaryMessage #[1 2 3])))
+       (def a (shown (websocket-next client)))
+       (def b (shown (websocket-next client)))
+       (websocket-close! client #:code 1000 #:reason "bye")
+       (def served (joined echoed))
+       (str a "|" b "|" served
+            "|" (status-text (sync (websocket-closed server)))
+            "|" (status-text (sync (websocket-closed client))))))))
+
+;; 200 bytes needs the 16-bit length and 70000 the 64-bit one, in both
+;; directions and through both maskings.
+(: scenario-large (-bjo-> string))
+(defbjo (scenario-large)
+  (with-scope
+    (match (duplex)
+      ((Tuple (Tuple sin sout) (Tuple cin cout))
+       (def server (ports->websocket sin sout))
+       (def client (ports->websocket cin cout #:client #t))
+       (def echoed (bjo (echo server)))
+       (ignore (websocket-send! client (BinaryMessage (patterned 200))))
+       (ignore (websocket-send! client (BinaryMessage (patterned 70000))))
+       (def a (intact (websocket-next client)))
+       (def b (intact (websocket-next client)))
+       (websocket-close! client)
+       (str a "|" b "|" (joined echoed))))))
+
+(: scenario-server-closes (-bjo-> string))
+(defbjo (scenario-server-closes)
+  (with-scope
+    (match (duplex)
+      ((Tuple (Tuple sin sout) (Tuple cin cout))
+       (def server (ports->websocket sin sout))
+       (def client (ports->websocket cin cout #:client #t))
+       (websocket-close! server #:code 4001 #:reason "done")
+       (def seen (shown (websocket-next client)))
+       (def late (websocket-send! client (TextMessage "too late")))
+       (str seen
+            "|" (status-text (sync (websocket-closed server)))
+            "|" (status-text (sync (websocket-closed client)))
+            "|" (if late "sent" "refused"))))))
+
+;; ---------------------------------------------------------------------------
+;; A hand-written client against the server side
+;; ---------------------------------------------------------------------------
+
+;; `frames` from a raw client, then whatever the server does about them: the
+;; frames it sends back, until it closes, and how it thinks it ended.
+(: against-server (-bjo-> (Vec (Array byte)) int string))
+(defbjo (against-server frames max-message)
+  (with-scope
+    (match (duplex)
+      ((Tuple (Tuple sin sout) (Tuple cin cout))
+       (def server (ports->websocket sin sout #:max-message max-message))
+       (def reader (bjo (drain-messages server)))
+       (loop (:for f frames) (:do (send-raw cout f)))
+       (def back
+         (let go ((acc ""))
+           (let ((f (raw-frame cin)))
+             (if (= f "eof") acc (go (str acc f " "))))))
+       (str back "| "
+            (match (sync (promise-join reader))
+              ((Ok received) received)
+              ((Err e) (str "raised " (.-Message e))))
+            " | "
+            (int->string (close-code (sync (websocket-closed server)))))))))
+
+;; Every message the server received, comma separated.
+(: drain-messages (-bjo-> WebSocket string))
+(defbjo (drain-messages ws)
+  (let go ((acc ""))
+    (match (websocket-next ws)
+      ((Some m) (go (str acc (if (string-empty? acc) "" ",") (shown (Some m)))))
+      (None acc))))
+
+(: scenario-raw (-bjo-> (Vec (Array byte)) int string))
+(defbjo (scenario-raw frames max-message)
+  (against-server frames max-message))
+
+;; The peer closes its end with no close frame at all.
+(: scenario-hangup (-bjo-> string))
+(defbjo (scenario-hangup)
+  (with-scope
+    (match (duplex)
+      ((Tuple (Tuple sin sout) (Tuple cin cout))
+       (def server (ports->websocket sin sout))
+       (send-raw cout (client-frame #t 1 (text-bytes "hi")))
+       (close-byte-output-port! cout)
+       (def got (shown (websocket-next server)))
+       (def then (shown (websocket-next server)))
+       (str got "|" then "|" (int->string (close-code (sync (websocket-closed server)))))))))
+
+;; A ping after every idle stretch, and a close that nobody answers.
+(: scenario-keep-alive-and-timeout (-bjo-> string))
+(defbjo (scenario-keep-alive-and-timeout)
+  (with-scope
+    (match (duplex)
+      ((Tuple (Tuple sin sout) (Tuple cin cout))
+       (def server (ports->websocket sin sout #:keep-alive 20 #:close-timeout 100))
+       (def ping (raw-frame cin))
+       (websocket-close! server)
+       (def closing (past-pings cin))
+       (str ping "|" closing "|" (status-text (sync (websocket-closed server))))))))
+
+(defun (main)
+  (expect "the accept key from RFC 6455 section 1.3"
+          (websocket-accept-key "dGhlIHNhbXBsZSBub25jZQ==")
+          "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+
+  (expect "text and binary, echoed, and a close both sides agree on"
+          (ran (bjo (scenario-echo)))
+          "text:hello|binary:1.2.3.|2|1000:bye|1000:")
+
+  (expect "16-bit and 64-bit lengths, both ways"
+          (ran (bjo (scenario-large)))
+          "200:intact|70000:intact|2")
+
+  (expect "the server closes, and a send after that is refused"
+          (ran (bjo (scenario-server-closes)))
+          "none|4001:|4001:done|refused")
+
+  (expect "a fragmented message with a ping between its fragments"
+          (ran (bjo (scenario-raw [(client-frame #f 1 (text-bytes "hel"))
+                                   (client-frame #t 9 (text-bytes "p"))
+                                   (client-frame #t 0 (text-bytes "lo"))
+                                   (client-frame #t 8 (close-payload 1000))]
+                                  1024)))
+          "10:112. 8:1000 | text:hello | 1000")
+
+  (expect "an unmasked frame from a client is a protocol error"
+          (ran (bjo (scenario-raw [#[129 2 104 105]] 1024)))
+          "8:1002 |  | 1002")
+
+  (expect "a text message that is not UTF-8 closes with 1007"
+          (ran (bjo (scenario-raw [(client-frame #t 1 (from-hex "C328"))] 1024)))
+          "8:1007 |  | 1007")
+
+  (expect "a message over #:max-message closes with 1009"
+          (ran (bjo (scenario-raw [(client-frame #f 2 (patterned 6))
+                                   (client-frame #t 0 (patterned 6))]
+                                  10)))
+          "8:1009 |  | 1009")
+
+  (expect "a continuation with nothing to continue is a protocol error"
+          (ran (bjo (scenario-raw [(client-frame #t 0 (text-bytes "x"))] 1024)))
+          "8:1002 |  | 1002")
+
+  (expect "a close code nobody may send is a protocol error"
+          (ran (bjo (scenario-raw [(client-frame #t 8 (close-payload 1005))] 1024)))
+          "8:1002 |  | 1002")
+
+  (expect "a close with no code is answered with no code"
+          (ran (bjo (scenario-raw [(client-frame #t 8 (make-array 0))] 1024)))
+          "8: |  | 1005")
+
+  (expect "a peer that hangs up without a close frame"
+          (ran (bjo (scenario-hangup)))
+          "text:hi|none|1006")
+
+  (expect "a keep-alive ping, and a close nobody answers"
+          (ran (bjo (scenario-keep-alive-and-timeout)))
+          "9:|8:1000|1006:no close frame came back")
+
+  0)
