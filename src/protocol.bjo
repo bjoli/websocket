@@ -79,7 +79,7 @@
 ;; ===========================================================================
 
 ;; A whole message. A fragmented one arrives reassembled.
-(type (: Message (Union (TextMessage string) (BinaryMessage (Array byte)))))
+(type (: Message (Union (: TextMessage string) (: BinaryMessage (Array byte)))))
 
 ;; How a connection ended: the code and reason from the close frame, or one of
 ;; the codes RFC 6455 reserves for an ending that had none — 1005 when the
@@ -95,10 +95,10 @@
 ;; What the writer is asked to put on the wire. A `SendClose` with code 1005
 ;; is a close frame with no body, which is how a close that carried no code is
 ;; answered.
-(type (: Outgoing (Union (SendData Message)
-                         (SendPong (Array byte))
+(type (: Outgoing (Union (: SendData Message)
+                         (: SendPong (Array byte))
                          SendPing
-                         (SendClose int string))))
+                         (: SendClose int string))))
 
 ;; `sending-over` and `finished` are latches: inboxes that are never posted to,
 ;; only closed, because `inbox-closed` then fires for every waiter from then on.
@@ -224,9 +224,9 @@
         out)))
 
 ;; What one read of a frame came to.
-(type (: Received (Union (Got bool int (Array byte))   ; FIN, opcode, unmasked payload
-                         (Violation int string)        ; the close code to fail with
-                         (Hangup string))))            ; the transport ended or failed
+(type (: Received (Union (: Got bool int (Array byte))   ; FIN, opcode, unmasked payload
+                         (: Violation int string)        ; the close code to fail with
+                         (: Hangup string))))            ; the transport ended or failed
 
 ;; Exactly `n` bytes, or why not. A short read is the connection ending.
 (: take-bytes (-bjo-> ByteInputPort int (Result string (Array byte))))
