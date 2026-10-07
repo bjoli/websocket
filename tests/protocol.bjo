@@ -59,7 +59,7 @@
     ((Err e) (str "RAISED " (.-Message e)))))
 
 ;; A server's ports and a client's ports, joined by two pipes.
-(: duplex (-> (Tuple (Tuple ByteInputPort ByteOutputPort) (Tuple ByteInputPort ByteOutputPort))))
+(: duplex (-> (Tuple (Tuple InputPort ByteOutputPort) (Tuple InputPort ByteOutputPort))))
 (defun (duplex)
   (match (byte-pipe)
     ((Tuple up-in up-out)
@@ -136,7 +136,7 @@
 
 ;; One frame from the server, unmasked and under 126 bytes, as "opcode:body".
 ;; A close frame's body is its code; anything else is its bytes.
-(: raw-frame (-bjo-> ByteInputPort string))
+(: raw-frame (-bjo-> InputPort string))
 (defbjo (raw-frame in)
   (match (read-bytes in 2)
     (None "eof")
@@ -152,7 +152,7 @@
                 (bytes->text body)))))))
 
 ;; The first frame that is not a ping.
-(: past-pings (-bjo-> ByteInputPort string))
+(: past-pings (-bjo-> InputPort string))
 (defbjo (past-pings in)
   (let ((f (raw-frame in)))
     (if (= f "9:") (past-pings in) f)))

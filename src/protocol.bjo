@@ -229,7 +229,7 @@
                          (: Hangup string))))            ; the transport ended or failed
 
 ;; Exactly `n` bytes, or why not. A short read is the connection ending.
-(: take-bytes (-bjo-> ByteInputPort int (Result string (Array byte))))
+(: take-bytes (-bjo-> InputPort int (Result string (Array byte))))
 (defbjo (take-bytes in n)
   (if (= n 0)
       (Ok (new-bytes 0))
@@ -241,7 +241,7 @@
 
 ;; The extended payload length. The 64-bit form is refused above 2^31 - 1,
 ;; which is already past any `#:max-message` an `int` can say.
-(: payload-length (-bjo-> ByteInputPort int (Result Received int)))
+(: payload-length (-bjo-> InputPort int (Result Received int)))
 (defbjo (payload-length in len7)
   (cond
     ((< len7 126) (Ok len7))
@@ -259,7 +259,7 @@
            (Err (Violation 1009 "the message is too big")))
           (else (Ok (big-endian bs 4 4)))))))))
 
-(: read-payload (-bjo-> ByteInputPort bool int bool int int Received))
+(: read-payload (-bjo-> InputPort bool int bool int int Received))
 (defbjo (read-payload in fin opcode masked len7 max-message)
   (match (payload-length in len7)
     ((Err r) r)
@@ -277,7 +277,7 @@
 
 ;; One frame. A server requires every frame masked and a client requires none
 ;; to be, which is RFC 6455 section 5.1.
-(: read-frame (-bjo-> ByteInputPort bool int Received))
+(: read-frame (-bjo-> InputPort bool int Received))
 (defbjo (read-frame in client max-message)
   (match (take-bytes in 2)
     ((Err why) (Hangup why))
@@ -362,7 +362,7 @@
 
 ;; Frames until a close frame, a violation or the end of the connection. `kind`
 ;; is the opcode of the message being reassembled, 0 between messages.
-(: read-loop (-bjo-> WebSocket ByteInputPort bool int CloseStatus))
+(: read-loop (-bjo-> WebSocket InputPort bool int CloseStatus))
 (defbjo (read-loop ws in client max-message)
   (let go ((kind 0) (parts (list)) (size 0))
     (match (read-frame in client max-message)
@@ -390,7 +390,7 @@
              (deliver ws m)
              (go 0 (list) 0)))))))))
 
-(: reading (-bjo-> WebSocket ByteInputPort bool int CloseStatus))
+(: reading (-bjo-> WebSocket InputPort bool int CloseStatus))
 (defbjo (reading ws in client max-message)
   (try (read-loop ws in client max-message)
     #:finally (let ()
@@ -454,7 +454,7 @@
 ;; closed or the connection broke, and the writer only has the reply to send.
 ;; When the writer finishes first, a close frame went out and the reader is
 ;; waiting for the peer's.
-(: run-connection (-bjo-> WebSocket ByteInputPort ByteOutputPort bool int int int void))
+(: run-connection (-bjo-> WebSocket InputPort ByteOutputPort bool int int int void))
 (defbjo (run-connection ws in out client max-message keep-alive close-timeout)
   (try
       (box-set! (record-ref ws status)
@@ -479,7 +479,7 @@
                 ;; Every step is guarded, because `finished` must close whatever
                 ;; state the connection was left in.
                 (ignore (try (close-byte-output-port! out) #:catch (System.Exception)))
-                (ignore (try (close-byte-input-port! in) #:catch (System.Exception)))
+                (ignore (try (close-input-port in) #:catch (System.Exception)))
                 (inbox-close! (record-ref ws finished)))))
 
 ;; ===========================================================================
@@ -499,7 +499,7 @@
 ;; `#:keep-alive` sends a ping after that many idle milliseconds, 0 for never.
 ;; `#:close-timeout` is how long either side of the close handshake is waited
 ;; for before the connection is dropped.
-(: ports->websocket (-> ByteInputPort ByteOutputPort
+(: ports->websocket (-> InputPort ByteOutputPort
                         (#:client bool) (#:protocol string) (#:max-message int)
                         (#:keep-alive int) (#:close-timeout int)
                         WebSocket))

@@ -78,7 +78,7 @@
 ;; ---------------------------------------------------------------------------
 
 ;; The request head, read a byte at a time so nothing after it is taken.
-(: read-request-head (-bjo-> ByteInputPort string))
+(: read-request-head (-bjo-> InputPort string))
 (defbjo (read-request-head in)
   (let go ((acc ""))
     (if (string-ends-with? acc "\r\n\r\n")
@@ -118,7 +118,7 @@
            (send-raw out (text-bytes (str "HTTP/1.1 " status "\r\nContent-Length: 0\r\n\r\n")))
            (shutdown! out)
            (close-byte-output-port! out)
-           (close-byte-input-port! in)
+           (close-input-port in)
            request-line)))))
 
 (: scenario-connect (-bjo-> string))

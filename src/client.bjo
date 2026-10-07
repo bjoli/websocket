@@ -93,7 +93,7 @@
        "\r\n"))
 
 ;; One byte, or why not.
-(: take-byte (-bjo-> ByteInputPort (Result string (Array byte))))
+(: take-byte (-bjo-> InputPort (Result string (Array byte))))
 (defbjo (take-byte in)
   (match (sync (read-bytes-evt in 1))
     ((Ok (Some b)) (Ok b))
@@ -102,7 +102,7 @@
 
 ;; The response head, up to and including the blank line, and not a byte more:
 ;; a frame the server sends straight after it has to stay in the port.
-(: read-head (-bjo-> ByteInputPort int (Result string string)))
+(: read-head (-bjo-> InputPort int (Result string string)))
 (defbjo (read-head in limit)
   (def acc (Chunks.))
   (let go ((n 0) (window 0))
@@ -163,10 +163,10 @@
      (Err (str "the server chose a protocol that was not offered: " chosen)))
     (else (Ok chosen))))
 
-(: shut (-> ByteInputPort ByteOutputPort void))
+(: shut (-> InputPort ByteOutputPort void))
 (defun (shut in out)
   (close-byte-output-port! out)
-  (close-byte-input-port! in))
+  (close-input-port in))
 
 ;; ===========================================================================
 ;; Connecting
