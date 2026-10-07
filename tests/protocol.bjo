@@ -28,7 +28,6 @@
 (import/extern
   (int->byte (: System.Convert.ToByte  (-> int byte)))
   (byte->int (: System.Convert.ToInt32 (-> byte int)))
-  (to-bytes  (: System.Text.Encoding.GetBytes (-> Encoding string (Array byte))))
   (from-hex  (: System.Convert.FromHexString (-> string (Array byte)))))
 
 ;; ---------------------------------------------------------------------------
@@ -120,7 +119,7 @@
   out)
 
 (: text-bytes (-> string (Array byte)))
-(defun (text-bytes s) (to-bytes utf8 s))
+(defun (text-bytes s) (string->bytes s))
 
 (: close-payload (-> int (Array byte)))
 (defun (close-payload code)

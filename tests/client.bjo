@@ -26,10 +26,6 @@
 (import (net websocket client))
 (import (std simpletest))
 
-(import/extern
-  (to-bytes (: System.Text.Encoding.GetBytes (-> Encoding string (Array byte))))
-  (to-text  (: System.Text.Encoding.GetString (-> Encoding (Array byte) string))))
-
 ;; ---------------------------------------------------------------------------
 ;; Helpers
 ;; ---------------------------------------------------------------------------
@@ -66,7 +62,7 @@
       (None n))))
 
 (: text-bytes (-> string (Array byte)))
-(defun (text-bytes s) (to-bytes utf8 s))
+(defun (text-bytes s) (string->bytes s))
 
 (: send-raw (-bjo-> ByteOutputPort (Array byte) void))
 (defbjo (send-raw out bytes)
@@ -84,7 +80,7 @@
     (if (string-ends-with? acc "\r\n\r\n")
         acc
         (match (read-bytes in 1)
-          ((Some b) (go (str acc (to-text utf8 b))))
+          ((Some b) (go (str acc (bytes->string b))))
           (None acc)))))
 
 (: header-in (-> string string string))

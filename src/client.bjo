@@ -45,9 +45,6 @@
   (byte->int     (: System.Convert.ToInt32 (-> byte int)))
   (base64        (: System.Convert.ToBase64String (-> (Array byte) string)))
   (random-bytes  (: System.Security.Cryptography.RandomNumberGenerator.GetBytes (-> int (Array byte))))
-  (encode        (: System.Text.Encoding.GetBytes (-> Encoding string (Array byte))))
-  (decode        (: System.Text.Encoding.GetString (-> Encoding (Array byte) int int string)
-                    #:exceptions (System.Text.DecoderFallbackException)))
   (chunk-write!  (: System.IO.MemoryStream.Write (-> Chunks (Array byte) int int void)))
   (chunk-bytes   (: System.IO.MemoryStream.ToArray (-> Chunks (Array byte))))
 
@@ -109,10 +106,7 @@
     (cond
       ;; "\r\n\r\n", as the last four bytes read.
       ((= window 218762506)
-       (let ((bytes (chunk-bytes acc)))
-         (Ok (match (decode utf8 bytes 0 (array-length bytes))
-               ((Ok text) text)
-               ((Err e) "")))))
+       (Ok (bytes->string (chunk-bytes acc) #:replace (Some #\xFFFD))))
       ((>= n limit) (Err "the handshake response is too long"))
       (else
        (match (take-byte in)
@@ -193,7 +187,7 @@
        ((Err e) (Err e))
        ((Ok (Tuple in out))
         (def key (base64 (random-bytes 16)))
-        (write-bytes! out (encode utf8 (request-head target key protocols headers)))
+        (write-bytes! out (string->bytes (request-head target key protocols headers)))
         (flush! out)
         (match (read-head in 16384)
           ((Err why) (shut in out) (Err (ws-error why)))

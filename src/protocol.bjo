@@ -56,23 +56,20 @@
 ;; Interop
 ;; ===========================================================================
 
-(import/class
-  (Utf8Strict (: System.Text.UTF8Encoding (-> bool bool Utf8Strict))))
-
 (import/extern
   (int->byte    (: System.Convert.ToByte  (-> int byte)))
   (byte->int    (: System.Convert.ToInt32 (-> byte int)))
   (base64       (: System.Convert.ToBase64String (-> (Array byte) string)))
   (sha1         (: System.Security.Cryptography.SHA1.HashData (-> (Array byte) (Array byte))))
   (random-bytes (: System.Security.Cryptography.RandomNumberGenerator.GetBytes (-> int (Array byte))))
-  (block-copy   (: System.Buffer.BlockCopy (-> System.Array int System.Array int int void)))
-  (encode       (: System.Text.Encoding.GetBytes (-> Encoding string (Array byte))))
-  (decode       (: System.Text.Encoding.GetString (-> Encoding (Array byte) int int string)
-                   #:exceptions (System.Text.DecoderFallbackException))))
+  (block-copy   (: System.Buffer.BlockCopy (-> System.Array int System.Array int int void))))
 
 ;; Invalid UTF-8 in a text message closes the connection with 1007, so decoding
-;; has to fail rather than substitute U+FFFD.
-(def strict-utf8 (cast Encoding (Utf8Strict. #f #t)))
+;; has to fail rather than substitute U+FFFD, which is what `bytes->string`
+;; does without a `#:replace`.
+(: utf8-text (-> (Array byte) int int (Result Exception string)))
+(defun (utf8-text bytes start end)
+  (try (bytes->string bytes #:start start #:end end) #:catch (System.ArgumentException)))
 
 ;; ===========================================================================
 ;; The types
@@ -165,7 +162,7 @@
                 (go more at)))))))))
 
 (: utf8-bytes (-> string (Array byte)))
-(defun (utf8-bytes s) (encode utf8 s))
+(defun (utf8-bytes s) (string->bytes s))
 
 ;; ===========================================================================
 ;; Frames
@@ -313,14 +310,14 @@
     (:def code (big-endian body 0 2))
     ((not (valid-close-code? code)) (Err (Tuple 1002 "an invalid close code")))
     (else
-     (match (decode strict-utf8 body 2 (- n 2))
+     (match (utf8-text body 2 n)
        ((Ok text) (Ok (CloseStatus (code code) (reason text))))
        ((Err e) (Err (Tuple 1007 "a close reason that is not UTF-8")))))))
 
 (: to-message (-> int (Array byte) (Result string Message)))
 (defun (to-message kind payload)
   (if (= kind 1)
-      (match (decode strict-utf8 payload 0 (array-length payload))
+      (match (utf8-text payload 0 (array-length payload))
         ((Ok text) (Ok (TextMessage text)))
         ((Err e) (Err "a text message that is not UTF-8")))
       (Ok (BinaryMessage payload))))
