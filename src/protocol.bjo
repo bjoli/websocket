@@ -398,7 +398,7 @@
 ;; The writer
 ;; ===========================================================================
 
-(: write-item! (-bjo-> ByteOutputPort bool Outgoing void))
+(: write-item! (-bjo-> OutputPort bool Outgoing void))
 (defbjo (write-item! out client item)
   (def key (if client (Some (random-bytes 4)) None))
   (write-bytes! out
@@ -408,7 +408,7 @@
                   ((SendPong b) (frame-bytes 10 b key))
                   (SendPing (frame-bytes 9 (new-bytes 0) key))
                   ((SendClose code reason) (frame-bytes 8 (close-body code reason) key))))
-  (flush! out))
+  (flush-port out))
 
 (: idle (-> int (Event Unit)))
 (defun (idle keep-alive)
@@ -416,7 +416,7 @@
 
 ;; Until a close frame is written, or the reader has finished without handing
 ;; one over — the connection is gone and there is nobody to write to.
-(: write-loop (-bjo-> WebSocket ByteOutputPort bool int void))
+(: write-loop (-bjo-> WebSocket OutputPort bool int void))
 (defbjo (write-loop ws out client keep-alive)
   (let go ()
     (match (sync (choose (wrap (chan-recv (record-ref ws outgoing)) (fun (item) (Some item)))
@@ -431,7 +431,7 @@
 
 ;; A failed write ends the writer. The reader is then left to find out the same
 ;; thing, or to be stopped by the close timeout.
-(: writing (-bjo-> WebSocket ByteOutputPort bool int void))
+(: writing (-bjo-> WebSocket OutputPort bool int void))
 (defbjo (writing ws out client keep-alive)
   (try (ignore (try (write-loop ws out client keep-alive) #:catch (System.Exception)))
     #:finally (inbox-close! (record-ref ws sending-over))))
@@ -451,7 +451,7 @@
 ;; closed or the connection broke, and the writer only has the reply to send.
 ;; When the writer finishes first, a close frame went out and the reader is
 ;; waiting for the peer's.
-(: run-connection (-bjo-> WebSocket InputPort ByteOutputPort bool int int int void))
+(: run-connection (-bjo-> WebSocket InputPort OutputPort bool int int int void))
 (defbjo (run-connection ws in out client max-message keep-alive close-timeout)
   (try
       (box-set! (record-ref ws status)
@@ -475,7 +475,7 @@
     #:finally (let ()
                 ;; Every step is guarded, because `finished` must close whatever
                 ;; state the connection was left in.
-                (ignore (try (close-byte-output-port! out) #:catch (System.Exception)))
+                (ignore (try (close-output-port out) #:catch (System.Exception)))
                 (ignore (try (close-input-port in) #:catch (System.Exception)))
                 (inbox-close! (record-ref ws finished)))))
 
@@ -496,7 +496,7 @@
 ;; `#:keep-alive` sends a ping after that many idle milliseconds, 0 for never.
 ;; `#:close-timeout` is how long either side of the close handshake is waited
 ;; for before the connection is dropped.
-(: ports->websocket (-> InputPort ByteOutputPort
+(: ports->websocket (-> InputPort OutputPort
                         (#:client bool) (#:protocol string) (#:max-message int)
                         (#:keep-alive int) (#:close-timeout int)
                         WebSocket))

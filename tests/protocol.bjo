@@ -58,7 +58,7 @@
     ((Err e) (str "RAISED " (.-Message e)))))
 
 ;; A server's ports and a client's ports, joined by two pipes.
-(: duplex (-> (Tuple (Tuple InputPort ByteOutputPort) (Tuple InputPort ByteOutputPort))))
+(: duplex (-> (Tuple (Tuple InputPort OutputPort) (Tuple InputPort OutputPort))))
 (defun (duplex)
   (match (byte-pipe)
     ((Tuple up-in up-out)
@@ -128,10 +128,10 @@
   (array-set! out 1 (int->byte (bitwise-and code 255)))
   out)
 
-(: send-raw (-bjo-> ByteOutputPort (Array byte) void))
+(: send-raw (-bjo-> OutputPort (Array byte) void))
 (defbjo (send-raw out bytes)
   (write-bytes! out bytes)
-  (flush! out))
+  (flush-port out))
 
 ;; One frame from the server, unmasked and under 126 bytes, as "opcode:body".
 ;; A close frame's body is its code; anything else is its bytes.
@@ -255,7 +255,7 @@
       ((Tuple (Tuple sin sout) (Tuple cin cout))
        (def server (ports->websocket sin sout))
        (send-raw cout (client-frame #t 1 (text-bytes "hi")))
-       (close-byte-output-port! cout)
+       (close-output-port cout)
        (def got (shown (websocket-next server)))
        (def then (shown (websocket-next server)))
        (str got "|" then "|" (int->string (close-code (sync (websocket-closed server)))))))))

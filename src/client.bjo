@@ -157,9 +157,9 @@
      (Err (str "the server chose a protocol that was not offered: " chosen)))
     (else (Ok chosen))))
 
-(: shut (-> InputPort ByteOutputPort void))
+(: shut (-> InputPort OutputPort void))
 (defun (shut in out)
-  (close-byte-output-port! out)
+  (close-output-port out)
   (close-input-port in))
 
 ;; ===========================================================================
@@ -188,7 +188,7 @@
        ((Ok (Tuple in out))
         (def key (base64 (random-bytes 16)))
         (write-bytes! out (string->bytes (request-head target key protocols headers)))
-        (flush! out)
+        (flush-port out)
         (match (read-head in 16384)
           ((Err why) (shut in out) (Err (ws-error why)))
           ((Ok head)

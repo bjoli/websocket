@@ -39,14 +39,16 @@ server does not carry it.
 #+BEGIN_SRC scheme
 (depends
   (package (name (net websocket))
-           (version (version-at-least "0.1.1"))
+           (version (version-at-least "0.5.0"))
            (source (git (url "https://github.com/bjoli/websocket")))))
 #+END_SRC
 
-From 0.1.1 on, closing a socket relies on ~close-byte-output-port!~ suspending
-on a fiber, so that the close works over a stream that refuses blocking I/O
-(Kestrel's). Bjolang has done that since "Closing a byte output port writes
-only what is pending" in its changelog. 0.1.0 works with older Bjolang.
+From 0.5.0 on, the package is written against Bjolang's one ~OutputPort~
+type ("One output port type, which writes UTF-8" in its changelog); 0.4.0
+works with the Bjolang before it.
+
+Closing a socket relies on ~close-output-port~ suspending on a fiber, so that
+the close works over a stream that refuses blocking I/O (Kestrel's).
 
 ** Types =(net websocket protocol)=
 
@@ -114,8 +116,9 @@ A chat session waits on the client and on the room at once:
 
 Three fibers per socket. A reader turns frames into messages and queues them in
 an inbox, which is what makes ~websocket-recv~ an event that loses nothing. A
-writer owns the output port — a byte output port must not be written by two
-fibers — so user sends, pongs and close frames all go through it. A third runs
+writer owns the output port — a frame is several writes, and two fibers
+writing frames to one port would interleave them — so user sends, pongs and
+close frames all go through it. A third runs
 the close handshake and closes the ports.
 
 That fiber is a daemon of the ambient scope. A connection ends on its own when

@@ -64,10 +64,10 @@
 (: text-bytes (-> string (Array byte)))
 (defun (text-bytes s) (string->bytes s))
 
-(: send-raw (-bjo-> ByteOutputPort (Array byte) void))
+(: send-raw (-bjo-> OutputPort (Array byte) void))
 (defbjo (send-raw out bytes)
   (write-bytes! out bytes)
-  (flush! out))
+  (flush-port out))
 
 ;; ---------------------------------------------------------------------------
 ;; Over TCP, with the handshake
@@ -113,7 +113,7 @@
          (let ()
            (send-raw out (text-bytes (str "HTTP/1.1 " status "\r\nContent-Length: 0\r\n\r\n")))
            (shutdown! out)
-           (close-byte-output-port! out)
+           (close-output-port out)
            (close-input-port in)
            request-line)))))
 
