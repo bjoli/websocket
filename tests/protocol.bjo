@@ -266,7 +266,7 @@
   (with-scope
     (match (duplex)
       ((Tuple (Tuple sin sout) (Tuple cin cout))
-       (def server (ports->websocket sin sout #:keep-alive 20 #:close-timeout 100))
+       (def server (ports->websocket sin sout #:keep-alive (Some (milliseconds 20)) #:close-timeout (milliseconds 100)))
        (def ping (raw-frame cin))
        (websocket-close! server)
        (def closing (past-pings cin))

@@ -63,13 +63,13 @@ the close works over a stream that refuses blocking I/O (Kestrel's).
 ** Opening one
 
 - ~(websocket-connect url #:protocols [] #:headers [] #:max-message 16777216
-  #:keep-alive 0)~ : ~(Result Exception WebSocket)~, in ~(net websocket
+  #:keep-alive None)~ : ~(Result Exception WebSocket)~, in ~(net websocket
   client)~. Connects to a ~ws://~ URL and runs the opening handshake.
   ~#:protocols~ is offered as ~Sec-WebSocket-Protocol~; ~#:headers~ are added
   to the request as they are. A response other than ~101~ is an ~Err~ whose
   message holds the status line.
 - ~(ports->websocket in out #:client #f #:protocol "" #:max-message 16777216
-  #:keep-alive 0 #:close-timeout 5000)~ : ~WebSocket~. A socket over two ports
+  #:keep-alive None #:close-timeout (seconds 5))~ : ~WebSocket~. A socket over two ports
   whose handshake is already done. ~#:client~ says which side of the protocol
   this is: a client masks what it sends, and a server refuses anything unmasked.
   ~#:protocol~ is what the handshake agreed on.
@@ -77,9 +77,10 @@ the close works over a stream that refuses blocking I/O (Kestrel's).
   ~Sec-WebSocket-Key~, for a server doing its own handshake.
 
 ~#:max-message~ bounds a message after reassembly; a bigger one closes the
-connection with 1009. ~#:keep-alive~ sends a ping after that many idle
-milliseconds, 0 for never. ~#:close-timeout~ is how long each side of the close
-handshake is waited for before the connection is dropped.
+connection with 1009. ~#:keep-alive~ is an ~(Option Duration)~: ~(Some d)~ sends
+a ping after ~d~ of idle time, ~None~ never does. ~#:close-timeout~ is a
+~Duration~: how long each side of the close handshake is waited for before the
+connection is dropped.
 
 Not supported: ~wss://~, extensions (so no permessage-deflate), and sending a
 message in fragments.

@@ -410,13 +410,15 @@
                   ((SendClose code reason) (frame-bytes 8 (close-body code reason) key))))
   (flush-port out))
 
-(: idle (-> int (Event Unit)))
+(: idle (-> (Option Duration) (Event Unit)))
 (defun (idle keep-alive)
-  (if (> keep-alive 0) (timeout keep-alive) (never)))
+  (match keep-alive
+    ((Some d) (timeout d))
+    (None (never))))
 
 ;; Until a close frame is written, or the reader has finished without handing
 ;; one over — the connection is gone and there is nobody to write to.
-(: write-loop (-bjo-> WebSocket OutputPort bool int void))
+(: write-loop (-bjo-> WebSocket OutputPort bool (Option Duration) void))
 (defbjo (write-loop ws out client keep-alive)
   (let go ()
     (match (sync (choose (wrap (chan-recv (record-ref ws outgoing)) (fun (item) (Some item)))
@@ -431,7 +433,7 @@
 
 ;; A failed write ends the writer. The reader is then left to find out the same
 ;; thing, or to be stopped by the close timeout.
-(: writing (-bjo-> WebSocket OutputPort bool int void))
+(: writing (-bjo-> WebSocket OutputPort bool (Option Duration) void))
 (defbjo (writing ws out client keep-alive)
   (try (ignore (try (write-loop ws out client keep-alive) #:catch (System.Exception)))
     #:finally (inbox-close! (record-ref ws sending-over))))
@@ -447,11 +449,11 @@
     ((Err e) (CloseStatus (code 1006) (reason (.-Message e))))))
 
 ;; Runs the reader and the writer, and waits for whichever did not finish first
-;; for at most `close-timeout` ms. When the reader finishes first, the peer
+;; for at most `close-timeout`. When the reader finishes first, the peer
 ;; closed or the connection broke, and the writer only has the reply to send.
 ;; When the writer finishes first, a close frame went out and the reader is
 ;; waiting for the peer's.
-(: run-connection (-bjo-> WebSocket InputPort OutputPort bool int int int void))
+(: run-connection (-bjo-> WebSocket InputPort OutputPort bool int (Option Duration) Duration void))
 (defbjo (run-connection ws in out client max-message keep-alive close-timeout)
   (try
       (box-set! (record-ref ws status)
@@ -493,15 +495,14 @@
 ;; sends and a server refuses anything unmasked. `#:protocol` is what the
 ;; handshake agreed on, for `websocket-protocol`. `#:max-message` bounds a
 ;; message after reassembly; a bigger one closes the connection with 1009.
-;; `#:keep-alive` sends a ping after that many idle milliseconds, 0 for never.
 ;; `#:close-timeout` is how long either side of the close handshake is waited
 ;; for before the connection is dropped.
 (: ports->websocket (-> InputPort OutputPort
                         (#:client bool) (#:protocol string) (#:max-message int)
-                        (#:keep-alive int) (#:close-timeout int)
+                        (#:keep-alive (Option Duration)) (#:close-timeout Duration)
                         WebSocket))
 (defun (ports->websocket in out #:client #f #:protocol "" #:max-message 16777216
-                         #:keep-alive 0 #:close-timeout 5000)
+                         #:keep-alive None #:close-timeout (seconds 5))
   (def ws (WebSocket (incoming (make-inbox 16 DropNewest))
                      (outgoing (make-chan))
                      (sending-over (latch))

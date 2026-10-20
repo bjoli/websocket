@@ -176,10 +176,10 @@
 (: websocket-connect (-bjo-> string
                              (#:protocols (Vec string))
                              (#:headers (Vec (Tuple string string)))
-                             (#:max-message int) (#:keep-alive int)
+                             (#:max-message int) (#:keep-alive (Option Duration))
                              (Result Exception WebSocket)))
 (defbjo (websocket-connect url #:protocols (vec-empty) #:headers (vec-empty)
-                           #:max-message 16777216 #:keep-alive 0)
+                           #:max-message 16777216 #:keep-alive None)
   (match (parse-target url)
     ((Err e) (Err e))
     ((Ok target)
