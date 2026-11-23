@@ -65,11 +65,11 @@
   (block-copy   (: System.Buffer.BlockCopy (-> System.Array int System.Array int int void))))
 
 ;; Invalid UTF-8 in a text message closes the connection with 1007, so decoding
-;; has to fail rather than substitute U+FFFD, which is what `bytes->string`
-;; does without a `#:replace`.
-(: utf8-text (-> (Array byte) int int (Result Exception string)))
+;; has to fail rather than substitute U+FFFD: `bytes->string`, not
+;; `bytes->string/lossy`.
+(: utf8-text (-> (Array byte) int int (Result DecodeError string)))
 (defun (utf8-text bytes start end)
-  (try (bytes->string bytes #:start start #:end end) #:catch (System.ArgumentException)))
+  (bytes->string bytes #:start start #:end end))
 
 ;; ===========================================================================
 ;; The types

@@ -80,7 +80,7 @@
     (if (string-ends-with? acc "\r\n\r\n")
         acc
         (match (read-bytes in 1)
-          ((Some b) (go (str acc (bytes->string b))))
+          ((Some b) (go (str acc (bytes->string/lossy b))))
           (None acc)))))
 
 (: header-in (-> string string string))

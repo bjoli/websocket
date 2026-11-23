@@ -106,7 +106,7 @@
     (cond
       ;; "\r\n\r\n", as the last four bytes read.
       ((= window 218762506)
-       (Ok (bytes->string (chunk-bytes acc) #:replace (Some #\xFFFD))))
+       (Ok (bytes->string/lossy (chunk-bytes acc))))
       ((>= n limit) (Err "the handshake response is too long"))
       (else
        (match (take-byte in)
